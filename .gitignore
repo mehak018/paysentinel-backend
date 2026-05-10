@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+.env
+
+
+uploads/
+
+# Logs
+npm-debug.log*
+*.log
+
+# Editor
+.DS_Store
+.vscode/
