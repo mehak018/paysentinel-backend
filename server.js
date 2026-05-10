@@ -29,9 +29,25 @@ const PORT = process.env.PORT || 5000;
 
 // 1. CORS — allows your React app to make requests to this server
 //    Without this, browsers block cross-origin requests for security
+// CORS — allow both local development and production frontend
 app.use(cors({
-  origin:      process.env.FRONTEND_URL || 'http://localhost:3000',
-  methods:     ['GET', 'POST', 'PUT', 'DELETE'],
+  origin: function (origin, callback) {
+    // Allowed origins list
+    const allowedOrigins = [
+      'http://localhost:3000',                    // local React dev
+      process.env.FRONTEND_URL,                   // production Vercel URL
+    ].filter(Boolean); // remove undefined values
+
+    // Allow requests with no origin (mobile apps, Postman, curl)
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS blocked: ${origin}`));
+    }
+  },
+  methods:     ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   credentials: true,
 }));
 
