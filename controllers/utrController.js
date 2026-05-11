@@ -1,201 +1,195 @@
 // controllers/utrController.js
-// ─────────────────────────────────────────────────────────────
-// This controller handles UTR (Unique Transaction Reference)
-// verification. In production you'd connect to a real banking
-// API (NPCI, Razorpay, etc.). Here we simulate the logic
-// with realistic rules so you understand the structure.
-// ─────────────────────────────────────────────────────────────
+// Fixed version — much smarter UTR validation logic
 
 const { v4: uuidv4 } = require('uuid');
 
-// ── Simulated UTR database ───────────────────────────────────
-// In production: query NPCI API or your payment gateway
-const VALID_UTRS = {
-  '412938001122': {
-    amount: 5000, bank: 'State Bank of India',
-    timestamp: '2025-05-14T10:24:00Z',
-    sender: 'Rahul S.', receiver: 'Raj Electronics',
-    status: 'SUCCESS'
-  },
-  '519827364011': {
-    amount: 800,  bank: 'HDFC Bank',
-    timestamp: '2025-05-14T11:02:00Z',
-    sender: 'Priya M.', receiver: 'Priya Stores',
-    status: 'SUCCESS'
-  },
-  '623819204756': {
-    amount: 2300, bank: 'ICICI Bank',
-    timestamp: '2025-05-14T12:10:00Z',
-    sender: 'Amazon Pay', receiver: 'Customer',
-    status: 'SUCCESS'
-  },
+// ── Real UTR format rules ─────────────────────────────────
+// Real Indian payment UTRs follow these patterns:
+// NEFT:  16 characters alphanumeric
+// RTGS:  16 characters alphanumeric  
+// IMPS:  12 digit numeric
+// UPI:   12-22 digit numeric
+
+const UTR_FORMATS = {
+  UPI:  { minLen: 12, maxLen: 22, pattern: /^\d+$/,
+          desc: '12-22 digit number' },
+  NEFT: { minLen: 16, maxLen: 16, pattern: /^[A-Z]{4}\d{12}$/i,
+          desc: '16 characters (4 letters + 12 digits)' },
+  RTGS: { minLen: 16, maxLen: 16, pattern: /^[A-Z]{4}\d{12}$/i,
+          desc: '16 characters (4 letters + 12 digits)' },
+  IMPS: { minLen: 12, maxLen: 12, pattern: /^\d{12}$/,
+          desc: 'exactly 12 digits' },
 };
 
-// ── Fraud pattern rules ──────────────────────────────────────
-// These patterns flag suspicious UTR numbers
-const FRAUD_PATTERNS = [
+// ── Definite fraud patterns ───────────────────────────────
+// These are ALWAYS fraud — no exceptions
+const DEFINITE_FRAUD_PATTERNS = [
   {
-    // All zeros or sequential numbers are never real UTRs
-    test: (utr) => /^0+$/.test(utr) || /^123456/.test(utr),
-    reason: 'UTR contains invalid sequential or zero pattern'
+    test: (utr) => /^0+$/.test(utr),
+    reason: 'UTR is all zeros — clearly fabricated'
   },
   {
-    // Too short — real UTRs are 12-22 digits
-    test: (utr) => utr.length < 12,
-    reason: 'UTR is too short — real UTRs have 12-22 digits'
+    test: (utr) => /^1234567890/.test(utr),
+    reason: 'UTR is a sequential test number — not a real transaction'
   },
   {
-    // Contains letters — UTRs are numeric only
-    test: (utr) => /[a-zA-Z]/.test(utr),
-    reason: 'UTR contains letters — real UTRs are numeric only'
+    test: (utr) => utr.length < 8,
+    reason: 'UTR is too short — real UTRs have at least 12 characters'
+  },
+  {
+    test: (utr) => {
+      // All same digit like 111111111111 or 222222222222
+      return /^(.)\1+$/.test(utr);
+    },
+    reason: 'UTR contains repeated identical digits — invalid pattern'
   },
 ];
 
-// ── Risk score calculator ────────────────────────────────────
-// Returns 0–100. Higher = more suspicious.
-const calculateRiskScore = (utrNumber, paymentMethod, expectedAmount) => {
+// ── Format validator ──────────────────────────────────────
+const validateFormat = (utr, method) => {
+  const format = UTR_FORMATS[method.toUpperCase()];
+  if (!format) return { valid: true, reason: '' }; // unknown method, don't penalize
+
+  if (utr.length < format.minLen || utr.length > format.maxLen) {
+    return {
+      valid: false,
+      reason: `${method} UTR should be ${format.desc}. ` +
+              `You entered ${utr.length} characters.`
+    };
+  }
+
+  if (!format.pattern.test(utr)) {
+    return {
+      valid: false,
+      reason: `${method} UTR format is invalid. Expected ${format.desc}.`
+    };
+  }
+
+  return { valid: true, reason: '' };
+};
+
+// ── Risk score (lower = safer) ────────────────────────────
+const calculateRiskScore = (utr, method, amount) => {
   let score = 0;
 
-  // Repeated digits (e.g. 111111111111) — suspicious
-  const uniqueDigits = new Set(utrNumber.split('')).size;
-  if (uniqueDigits <= 2) score += 40;
+  // Very round large amounts can be slightly suspicious
+  if (amount && amount > 50000 && amount % 10000 === 0) score += 5;
 
-  // Very round amounts are sometimes suspicious
-  if (expectedAmount && expectedAmount % 1000 === 0
-      && expectedAmount > 10000) score += 10;
-
-  // Unknown payment method
-  const validMethods = ['upi', 'neft', 'rtgs', 'imps'];
-  if (paymentMethod &&
-      !validMethods.includes(paymentMethod.toLowerCase())) score += 20;
+  // Mostly sequential digits
+  let sequential = 0;
+  for (let i = 0; i < utr.length - 1; i++) {
+    if (Math.abs(parseInt(utr[i+1]) - parseInt(utr[i])) === 1) sequential++;
+  }
+  if (sequential > utr.length * 0.7) score += 20;
 
   return Math.min(score, 100);
 };
 
-// ── POST /api/utr/verify ─────────────────────────────────────
+// ── POST /api/utr/verify ──────────────────────────────────
 const verifyUTR = async (req, res, next) => {
   try {
-    const { utrNumber, paymentMethod, expectedAmount } = req.body;
+    const { utrNumber, paymentMethod = 'UPI', expectedAmount } = req.body;
 
-    // ── Input validation ──
     if (!utrNumber) {
       return res.status(400).json({
         success: false,
-        error:   'UTR number is required',
+        error: 'UTR number is required',
       });
     }
 
-    // Clean the UTR — remove spaces and dashes
-    const cleanUTR = utrNumber.replace(/[\s-]/g, '').trim();
+    // Clean input
+    const cleanUTR = utrNumber.replace(/[\s\-]/g, '').trim().toUpperCase();
 
-    // ── Check fraud patterns first ──
-    for (const pattern of FRAUD_PATTERNS) {
+    // ── Check definite fraud patterns first ──
+    for (const pattern of DEFINITE_FRAUD_PATTERNS) {
       if (pattern.test(cleanUTR)) {
         return res.json({
           success:    true,
           scanId:     uuidv4(),
           verdict:    'FRAUD',
-          confidence: 96,
-          riskScore:  95,
+          confidence: 97,
+          riskScore:  97,
           utrNumber:  cleanUTR,
           reason:     pattern.reason,
           details: {
-            foundInDatabase:  false,
-            patternMatch:     true,
-            recommendation:   'Do NOT release goods or services. Report this transaction.',
-            checkedAt:        new Date().toISOString(),
+            formatValid:     false,
+            patternFlagged:  true,
+            paymentMethod,
+            recommendation:
+              'This UTR is clearly fabricated. ' +
+              'Do NOT release goods. Report to cybercrime.',
+            checkedAt: new Date().toISOString(),
           },
         });
       }
     }
 
-    // ── Check against known valid UTRs ──
-    const utrRecord = VALID_UTRS[cleanUTR];
-
-    if (utrRecord) {
-      // Found in database — genuine
-      const amountMatch = !expectedAmount ||
-        Math.abs(utrRecord.amount - Number(expectedAmount)) < 1;
-
+    // ── Validate format based on payment method ──
+    const formatCheck = validateFormat(cleanUTR, paymentMethod);
+    if (!formatCheck.valid) {
       return res.json({
         success:    true,
         scanId:     uuidv4(),
-        verdict:    amountMatch ? 'GENUINE' : 'SUSPICIOUS',
-        confidence: amountMatch ? 99 : 72,
-        riskScore:  amountMatch ? 2 : 45,
+        verdict:    'SUSPICIOUS',
+        confidence: 78,
+        riskScore:  65,
         utrNumber:  cleanUTR,
-        reason:     amountMatch
-          ? 'UTR found and verified in payment records'
-          : 'UTR found but amount does not match — verify carefully',
+        reason:     formatCheck.reason,
         details: {
-          foundInDatabase:  true,
-          bank:             utrRecord.bank,
-          processedAt:      utrRecord.timestamp,
-          sender:           utrRecord.sender,
-          receiver:         utrRecord.receiver,
-          amount:           utrRecord.amount,
-          expectedAmount:   expectedAmount || null,
-          amountMatch,
-          paymentStatus:    utrRecord.status,
-          recommendation:   amountMatch
-            ? 'Payment verified. Safe to release goods/services.'
-            : 'Amount mismatch detected. Verify with sender before proceeding.',
-          checkedAt:        new Date().toISOString(),
+          formatValid:    false,
+          patternFlagged: false,
+          paymentMethod,
+          recommendation:
+            'Format does not match. Ask sender for the ' +
+            'original bank SMS or email receipt.',
+          checkedAt: new Date().toISOString(),
         },
       });
     }
 
-    // ── Not in database ──
-    // Calculate risk score for unknown UTRs
+    // ── UTR passed all checks — mark as likely genuine ──
+    // In production you would call NPCI / your payment gateway API here
+    // For now we trust any properly formatted UTR that passes fraud checks
     const riskScore = calculateRiskScore(
       cleanUTR, paymentMethod, expectedAmount
     );
 
-    const isHighRisk = riskScore >= 50;
+    const verdict    = riskScore >= 40 ? 'SUSPICIOUS' : 'GENUINE';
+    const confidence = riskScore >= 40 ? 70 : 92;
 
     return res.json({
       success:    true,
       scanId:     uuidv4(),
-      verdict:    isHighRisk ? 'FRAUD' : 'SUSPICIOUS',
-      confidence: isHighRisk ? 88 : 65,
+      verdict,
+      confidence,
       riskScore,
       utrNumber:  cleanUTR,
-      reason:     isHighRisk
-        ? 'UTR not found in payment records and shows high-risk patterns'
-        : 'UTR not found in our database — could not be verified',
+      reason: verdict === 'GENUINE'
+        ? 'UTR format is valid and passed all fraud pattern checks'
+        : 'UTR format is valid but shows some risk patterns — verify carefully',
       details: {
-        foundInDatabase: false,
-        patternMatch:    false,
-        riskFactors: [
-          riskScore > 30 ? 'UTR not in NPCI records' : null,
-          riskScore > 50 ? 'Suspicious digit pattern detected' : null,
-        ].filter(Boolean),
-        recommendation: isHighRisk
-          ? 'HIGH RISK: Do NOT release goods. Contact your bank immediately.'
-          : 'Could not verify. Ask sender for bank-generated payment receipt.',
+        formatValid:    true,
+        patternFlagged: false,
+        paymentMethod,
+        utrLength:      cleanUTR.length,
+        expectedAmount: expectedAmount || null,
+        recommendation: verdict === 'GENUINE'
+          ? 'UTR appears legitimate. ' +
+            'For large amounts, confirm with your bank before releasing goods.'
+          : 'Verify this UTR directly with your bank before proceeding.',
         checkedAt: new Date().toISOString(),
       },
     });
 
   } catch (error) {
-    // Pass error to global error handler
     next(error);
   }
 };
 
-// ── GET /api/utr/history ─────────────────────────────────────
+// ── GET /api/utr/history ──────────────────────────────────
 const getUTRHistory = async (req, res, next) => {
   try {
-    // Simulated history — in production, fetch from database
-    const history = [
-      { utr: '412938001122', verdict: 'GENUINE',    time: '10:24 AM', amount: 5000  },
-      { utr: '412938764502', verdict: 'FRAUD',      time: '10:31 AM', amount: 12500 },
-      { utr: '519827364011', verdict: 'GENUINE',    time: '11:02 AM', amount: 800   },
-      { utr: '000000000001', verdict: 'FRAUD',      time: '11:45 AM', amount: 45000 },
-      { utr: '623819204756', verdict: 'GENUINE',    time: '12:10 PM', amount: 2300  },
-    ];
-
-    res.json({ success: true, history });
+    res.json({ success: true, history: [] });
   } catch (error) {
     next(error);
   }

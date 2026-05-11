@@ -25,7 +25,7 @@ Node.js + Express REST API powering the PaySentinel fraud detection platform.
 ## 🚀 Run Locally
 
 1. Clone the repo
-   git clone https://github.com/YOUR_USERNAME/paysentinel-backend.git
+   git clone https://github.com/mehak018/paysentinel-backend.git
 
 2. Install dependencies
    cd paysentinel-backend
