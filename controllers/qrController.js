@@ -168,14 +168,34 @@ const analyzeUPI = (content, checks) => {
     upiId.endsWith(h)
   );
 
-  checks.push({
-    name: 'UPI Handle',
-    detail: upiId,
-    status: trustedHandle ? 'pass' : 'warn',
-    message: trustedHandle
-      ? 'Trusted bank handle'
-      : 'Unknown handle',
-  });
+  // Extract merchant name (pn field)
+const nameMatch = content.match(/pn=([^&]+)/);
+const merchantName = nameMatch
+  ? decodeURIComponent(nameMatch[1])
+  : null;
+
+// Fallback: derive name from UPI ID
+const derivedName = upiId.split('@')[0];
+const displayName = merchantName || derivedName;
+
+checks.push({
+  name: 'Merchant Name',
+  detail: `Name: ${displayName}`,
+  status: merchantName ? 'pass' : 'warn',
+  message: merchantName
+    ? `Merchant: ${merchantName}`
+    : '⚠ Name not present in QR — verify before paying',
+});
+
+// Keep existing UPI handle check (unchanged)
+checks.push({
+  name: 'UPI Handle',
+  detail: upiId,
+  status: trustedHandle ? 'pass' : 'warn',
+  message: trustedHandle
+    ? 'Trusted bank handle'
+    : 'Unknown handle',
+});
 
   if (!trustedHandle) riskScore += 15;
 

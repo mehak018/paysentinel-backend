@@ -1,43 +1,52 @@
 // config/multer.js
-// ─────────────────────────────────────────────────────────────
-// Multer handles file uploads. This config controls:
-// - Where files are saved
-// - What file types are allowed
-// - Maximum file size
-// ─────────────────────────────────────────────────────────────
-
 const multer = require('multer');
 const path   = require('path');
 const { v4: uuidv4 } = require('uuid');
+const fs     = require('fs');
 
-// Storage engine — controls where and how files are saved
+// ── Create uploads folder if it doesn't exist ─────────────
+// Use ABSOLUTE path — works on any system
+const UPLOADS_DIR = path.join(__dirname, '..', 'uploads');
+
+if (!fs.existsSync(UPLOADS_DIR)) {
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+  console.log('✅ Created uploads directory:', UPLOADS_DIR);
+}
+
+// ── Storage engine ─────────────────────────────────────────
 const storage = multer.diskStorage({
-  // Save to the 'uploads' folder
   destination: (req, file, cb) => {
-    cb(null, 'uploads/');
+    // Always use absolute path
+    cb(null, UPLOADS_DIR);
   },
-
-  // Give each file a unique name to prevent overwrites
-  // Example: a3f9c2d1-xxxx.png
   filename: (req, file, cb) => {
-    const uniqueName = `${uuidv4()}${path.extname(file.originalname)}`;
-    cb(null, uniqueName);
+    // Give unique name: uuid + original extension
+    const ext      = path.extname(file.originalname).toLowerCase();
+    const safeName = `${uuidv4()}${ext}`;
+    cb(null, safeName);
   },
 });
 
-// File filter — only allow image files
+// ── File filter ────────────────────────────────────────────
 const fileFilter = (req, file, cb) => {
-  const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+  const allowedTypes = [
+    'image/jpeg',
+    'image/jpg',
+    'image/png',
+    'image/webp',
+  ];
 
   if (allowedTypes.includes(file.mimetype)) {
-    cb(null, true);  // Accept the file
+    cb(null, true);
   } else {
-    // Reject with an error
-    cb(new Error('Only JPG, PNG, and WEBP images are allowed'), false);
+    cb(
+      new Error('Only JPG, PNG, and WEBP images are allowed'),
+      false
+    );
   }
 };
 
-// Create the multer upload handler
+// ── Export upload handler ──────────────────────────────────
 const upload = multer({
   storage,
   fileFilter,

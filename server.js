@@ -61,7 +61,8 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // 4. Serve uploaded files statically
 //    (so frontend can display uploaded screenshots)
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+app.use('/uploads', express.static(UPLOADS_DIR));
 // ── Routes ───────────────────────────────────────────────────
 // Each route file handles a group of related endpoints
 
