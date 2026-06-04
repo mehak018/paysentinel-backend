@@ -7,6 +7,7 @@
 const path   = require('path');
 const fs     = require('fs');
 const { v4: uuidv4 } = require('uuid');
+const Tesseract = require('tesseract.js');
 
 // Try to load sharp — graceful fallback if not installed
 let sharp;
@@ -114,7 +115,148 @@ const FILE_SIZE_RULES = {
 // ══════════════════════════════════════════════════════════
 // MAIN ANALYSIS FUNCTION
 // ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════
+// OCR — READ TEXT FROM IMAGE
+// ══════════════════════════════════════════════════════════
 
+const extractTextFromImage = async (imagePath) => {
+  try {
+    console.log('Running OCR on image...');
+    const { data: { text } } = await Tesseract.recognize(
+      imagePath,
+      'eng', // English language
+      {
+        // Quiet mode — no progress logs
+        logger: () => {},
+      }
+    );
+    console.log('OCR extracted text:', text.substring(0, 200));
+    return text;
+  } catch (err) {
+    console.error('OCR failed:', err.message);
+    return '';
+  }
+};
+
+// ══════════════════════════════════════════════════════════
+// EXTRACT UTR NUMBER FROM OCR TEXT
+// ══════════════════════════════════════════════════════════
+
+const extractUTRFromText = (text) => {
+  if (!text) return null;
+
+  // Clean the text — OCR sometimes adds extra spaces
+  const cleaned = text.replace(/\s+/g, ' ').toUpperCase();
+
+  // Pattern 1: "UTR: 202573372196" or "UTR No: 202573372196"
+  const utrLabelMatch = cleaned.match(
+    /UTR\s*(?:NO\.?|NUMBER|#|:)?\s*[:\-]?\s*([A-Z0-9]{10,22})/i
+  );
+  if (utrLabelMatch) return utrLabelMatch[1].trim();
+
+  // Pattern 2: "Ref No: T260514164326603" (transaction reference)
+  const refMatch = cleaned.match(
+    /(?:REF|REFERENCE|TXN|TRANSACTION)\s*(?:NO\.?|ID|#)?\s*[:\-]?\s*([A-Z0-9]{10,22})/i
+  );
+  if (refMatch) return refMatch[1].trim();
+
+  // Pattern 3: Standalone 12-digit number (UPI UTR format)
+  const standaloneMatch = cleaned.match(/\b(\d{12})\b/);
+  if (standaloneMatch) return standaloneMatch[1];
+
+  // Pattern 4: T + digits (PhonePe transaction ID format)
+  const phonePeMatch = cleaned.match(/\b(T\d{17,20})\b/);
+  if (phonePeMatch) return phonePeMatch[1];
+
+  return null;
+};
+
+// ══════════════════════════════════════════════════════════
+// EXTRACT AMOUNT FROM OCR TEXT
+// ══════════════════════════════════════════════════════════
+
+const extractAmountFromText = (text) => {
+  if (!text) return null;
+
+  // Pattern: ₹15 or Rs. 1,500 or INR 5000
+  const amountPatterns = [
+    /[₹]\s*([0-9,]+(?:\.\d{1,2})?)/,
+    /Rs\.?\s*([0-9,]+(?:\.\d{1,2})?)/i,
+    /INR\s*([0-9,]+(?:\.\d{1,2})?)/i,
+    /Paid\s*[₹Rs.]*\s*([0-9,]+(?:\.\d{1,2})?)/i,
+    /Amount\s*[₹Rs.:]*\s*([0-9,]+(?:\.\d{1,2})?)/i,
+    /Debited\s*[₹Rs.:]*\s*([0-9,]+(?:\.\d{1,2})?)/i,
+  ];
+
+  for (const pattern of amountPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      // Remove commas and parse
+      const amount = parseFloat(match[1].replace(/,/g, ''));
+      if (!isNaN(amount) && amount > 0) return amount;
+    }
+  }
+  return null;
+};
+
+// ══════════════════════════════════════════════════════════
+// DETECT PAYMENT APP FROM OCR TEXT
+// ══════════════════════════════════════════════════════════
+
+const detectPaymentAppFromText = (text) => {
+  const upper = text.toUpperCase();
+  if (upper.includes('PHONEPE'))    return 'PhonePe';
+  if (upper.includes('GOOGLE PAY') ||
+      upper.includes('GPAY'))       return 'Google Pay';
+  if (upper.includes('PAYTM'))      return 'Paytm';
+  if (upper.includes('AMAZON PAY')) return 'Amazon Pay';
+  if (upper.includes('BHIM'))       return 'BHIM';
+  if (upper.includes('NEFT') ||
+      upper.includes('RTGS') ||
+      upper.includes('IMPS'))       return 'Bank Transfer';
+  return null;
+};
+
+// ══════════════════════════════════════════════════════════
+// VERIFY UTR AGAINST DATABASE
+// Same logic as utrController but as a function
+// ══════════════════════════════════════════════════════════
+
+const verifyUTRNumber = (utrNumber, extractedAmount, expectedAmount) => {
+  if (!utrNumber) return null;
+
+  const cleanUTR = utrNumber.replace(/[\s\-]/g, '').toUpperCase();
+
+  // Definite fraud patterns
+  if (/^0+$/.test(cleanUTR))         return { verdict:'FRAUD', reason:'UTR is all zeros' };
+  if (/^(.)\1+$/.test(cleanUTR))     return { verdict:'FRAUD', reason:'UTR has repeated identical digits' };
+  if (cleanUTR.length < 8)           return { verdict:'FRAUD', reason:'UTR is too short' };
+  if (/^1234567890/.test(cleanUTR))  return { verdict:'FRAUD', reason:'UTR is sequential test number' };
+
+  // Amount cross-check
+  if (extractedAmount && expectedAmount) {
+    const expected = parseFloat(expectedAmount);
+    const diff     = Math.abs(extractedAmount - expected);
+    const pctDiff  = (diff / expected) * 100;
+
+    if (pctDiff > 1) {
+      // More than 1% difference = amount was changed
+      return {
+        verdict: 'FRAUD',
+        reason:  `Amount mismatch: screenshot shows ₹${extractedAmount} but expected ₹${expected}`,
+        extractedAmount,
+        expectedAmount: expected,
+      };
+    }
+  }
+
+  // Passed checks
+  return {
+    verdict:         'GENUINE',
+    reason:          'UTR format valid and amount matches',
+    extractedAmount,
+  };
+};
 const analyzeScreenshot = async (req, res, next) => {
   try {
     if (!req.file) {
@@ -216,24 +358,25 @@ const analyzeScreenshot = async (req, res, next) => {
     // Delete after analysis — don't store user images
     
     try { fs.unlinkSync(absoluteFilePath); } catch { /* ignore */ }
-    return res.json({
-      success:        true,
-      scanId:         uuidv4(),
-      verdict,
-      confidence:     Math.round(confidence),
-      riskScore,
-      fileName:       originalname || filename,
-      fileSize:       formatFileSize(size),
-      mimeType:       mimetype,
-      paymentApp:     paymentApp || 'Unknown',
-      expectedAmount: expectedAmount || null,
-      checks,
-      fraudReasons:   fraudFlags,
-      summary:        getSummary(verdict),
-      recommendation: getRecommendation(verdict),
-      analyzedAt:     new Date().toISOString(),
-    });
-
+   return res.json({
+  success:         true,
+  scanId:          uuidv4(),
+  verdict,
+  confidence:      Math.round(confidence),
+  riskScore,
+  fileName:        originalname || filename,
+  fileSize:        formatSize(size),
+  mimeType:        mimetype,
+  paymentApp:      paymentApp || detectedApp || 'Unknown',
+  extractedUTR:    extractedUTR   || null,   // ← NEW
+  extractedAmount: extractedAmount || null,   // ← NEW
+  detectedApp:     detectedApp    || null,   // ← NEW
+  checks,
+  fraudReasons:    fraudFlags,
+  summary:         getSummary(verdict),
+  recommendation:  getRecommendation(verdict),
+  analyzedAt:      new Date().toISOString(),
+});
   } catch (error) {
     // In the catch block at the bottom:
     if (req.file?.path) {
@@ -624,6 +767,134 @@ function checkExtensionMimeMatch(filename, mimetype, checks) {
     score: matches ? 0 : 35,
     flag:  matches ? null : `Extension/MIME mismatch: .${ext} vs ${mimetype}`,
   };
+}
+// ── Check 7: OCR Text Analysis ─────────────────────────────
+let extractedUTR    = null;
+let extractedAmount = null;
+let detectedApp     = null;
+let ocrText         = '';
+
+try {
+  // Run OCR to read text from image
+  ocrText        = await extractTextFromImage(absPath);
+  extractedUTR   = extractUTRFromText(ocrText);
+  extractedAmount = extractAmountFromText(ocrText);
+  detectedApp    = detectPaymentAppFromText(ocrText);
+
+  console.log('OCR UTR found:', extractedUTR);
+  console.log('OCR Amount found:', extractedAmount);
+  console.log('OCR App detected:', detectedApp);
+
+  // ── OCR Check A: Could we read text at all? ──
+  if (!ocrText || ocrText.trim().length < 20) {
+    checks.push({
+      name:    'Text Recognition (OCR)',
+      detail:  'Could not read text from image',
+      status:  'warn',
+      message: '⚠ Could not extract text — image may be blurry or heavily compressed',
+    });
+    riskScore += 10;
+  } else {
+    checks.push({
+      name:    'Text Recognition (OCR)',
+      detail:  `Read ${ocrText.trim().length} characters from image`,
+      status:  'pass',
+      message: `✓ Successfully extracted text from screenshot`,
+    });
+  }
+
+  // ── OCR Check B: UTR found and verified? ──
+  if (extractedUTR) {
+    const utrCheck = verifyUTRNumber(
+      extractedUTR, extractedAmount, expectedAmount
+    );
+
+    if (utrCheck.verdict === 'FRAUD') {
+      checks.push({
+        name:    'UTR Verification (from screenshot)',
+        detail:  `Extracted UTR: ${extractedUTR}`,
+        status:  'fail',
+        message: `🚨 ${utrCheck.reason}`,
+      });
+      riskScore += 60; // very strong signal
+      fraudFlags.push(utrCheck.reason);
+    } else {
+      checks.push({
+        name:    'UTR Verification (from screenshot)',
+        detail:  `Extracted UTR: ${extractedUTR}`,
+        status:  'pass',
+        message: `✓ UTR ${extractedUTR} extracted and format verified`,
+      });
+    }
+  } else {
+    checks.push({
+      name:    'UTR Verification (from screenshot)',
+      detail:  'No UTR number found in image',
+      status:  'warn',
+      message: '⚠ Could not find a UTR number in this screenshot — verify manually',
+    });
+    riskScore += 8;
+  }
+
+  // ── OCR Check C: Amount cross-verification ──
+  if (extractedAmount && expectedAmount) {
+    const expected = parseFloat(expectedAmount);
+    const diff     = Math.abs(extractedAmount - expected);
+    const pctDiff  = (diff / expected) * 100;
+
+    if (pctDiff > 1) {
+      checks.push({
+        name:    'Amount Cross-Verification',
+        detail:  `Screenshot: ₹${extractedAmount} vs Expected: ₹${expected}`,
+        status:  'fail',
+        message: `🚨 AMOUNT MISMATCH — Screenshot shows ₹${extractedAmount} but you expected ₹${expected}`,
+      });
+      riskScore += 65; // strongest possible signal
+      fraudFlags.push(
+        `Amount tampered: shows ₹${extractedAmount}, expected ₹${expected}`
+      );
+    } else {
+      checks.push({
+        name:    'Amount Cross-Verification',
+        detail:  `Screenshot: ₹${extractedAmount} vs Expected: ₹${expected}`,
+        status:  'pass',
+        message: `✓ Amount matches — screenshot shows ₹${extractedAmount}`,
+      });
+    }
+  } else if (extractedAmount) {
+    checks.push({
+      name:    'Amount Detected',
+      detail:  `Amount found: ₹${extractedAmount}`,
+      status:  'pass',
+      message: `✓ Screenshot amount: ₹${extractedAmount} (enter expected amount above to cross-verify)`,
+    });
+  }
+
+  // ── OCR Check D: Payment app verification ──
+  if (detectedApp && paymentApp &&
+      paymentApp !== 'Other' &&
+      paymentApp !== 'NEFT / Bank Transfer') {
+    const appMatches = detectedApp.toLowerCase() ===
+                       paymentApp.toLowerCase();
+    checks.push({
+      name:    'Payment App Verification',
+      detail:  `Detected: ${detectedApp} | Selected: ${paymentApp}`,
+      status:  appMatches ? 'pass' : 'warn',
+      message: appMatches
+        ? `✓ Screenshot is from ${detectedApp} as selected`
+        : `⚠ Screenshot appears to be from ${detectedApp} but you selected ${paymentApp}`,
+    });
+    if (!appMatches) riskScore += 15;
+  }
+
+} catch (ocrErr) {
+  console.error('OCR error:', ocrErr.message);
+  checks.push({
+    name:    'Text Recognition (OCR)',
+    detail:  'OCR engine error',
+    status:  'warn',
+    message: '⚠ Text recognition failed — manual verification required',
+  });
 }
 
 // ══════════════════════════════════════════════════════════
